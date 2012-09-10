@@ -178,7 +178,7 @@ class NodeConn(Greenlet):
         h = hashlib.sha256(th).digest()
         tmsg += h[:4]
         tmsg += data
-        self.sock.send(tmsg)
+        self.sock.sendall(tmsg)
         self.last_sent = time.time()
 
     def got_message(self, command, message):
