@@ -6,10 +6,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 #
 
-import gevent
-from gevent import Greenlet
-from gevent import monkey; monkey.patch_all()
-
+import asyncore
 import hashlib
 import sys
 import re
@@ -17,7 +14,6 @@ import socket
 import time
 import struct
 import random
-import signal
 
 import Log
 import codec_pb2
@@ -50,7 +46,7 @@ class MsgNull(object):
     def ParseFromString(self, data):
         pass
 
-class NodeConn(Greenlet):
+class NodeConn(asyncore.dispatcher):
     messagemap = {
         "version",
         "verack",
@@ -59,62 +55,83 @@ class NodeConn(Greenlet):
         "addr",
         "getaddr",
     }
-        
+
     def __init__(self, log, peermgr, sock=None, dstaddr=None, dstport=None):
-        Greenlet.__init__(self)
+        asyncore.dispatcher.__init__(self, sock=sock)
         self.log = log
         self.peermgr = peermgr
         self.dstaddr = dstaddr
         self.dstport = dstport
-        self.recvbuf = ""
-        self.ver_send = MIN_PROTO_VERSION
-        self.last_sent = 0
-
-        if sock is None:  # Outgoing client mode
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if sock is None:
+            self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.state = "connecting"
             self.outbound = True
-            #stuff version msg into sendbuf
-            vt = codec_pb2.MsgVersion()
-            vt.proto_ver = PROTO_VERSION
-            vt.client_ver = MY_SUBVERSION
-
-            self.log.write("connecting to " + self.dstaddr)
-            try:
-                self.sock = socket.socket()
-                self.sock.connect((dstaddr, dstport))
-            except:
-                self.handle_close()
-            self.send_message("version", vt, True)
-
-        else:  # Listening mode
-            self.sock = sock
+        else:
             self.outbound = False
             if self.dstaddr is None:
                 self.dstaddr = '0.0.0.0'
             if self.dstport is None:
                 self.dstport = 0
+            self.state = "connected"
             self.log.write(self.dstaddr + " connected")
+        self.sendbuf = ""
+        self.recvbuf = ""
+        self.ver_send = MIN_PROTO_VERSION
+        self.last_sent = 0
 
+        if sock is None:
+            #stuff version msg into sendbuf
+            vt = codec_pb2.MsgVersion()
+            vt.proto_ver = PROTO_VERSION
+            vt.client_ver = MY_SUBVERSION
+            self.send_message("version", vt, True)
 
-    def _run(self):
-        self.log.write(self.dstaddr + " connected")
-        while True:
+            self.log.write("connecting to " + self.dstaddr)
             try:
-                t = self.sock.recv(8192)
-                if len(t) <= 0: raise ValueError
-            except (IOError, ValueError):
+                self.connect((dstaddr, dstport))
+            except:
                 self.handle_close()
-                return
-            self.recvbuf += t
-            self.got_data()
+
+    def handle_connect(self):
+        self.log.write(self.dstaddr + " connected")
+        self.state = "connected"
 
     def handle_close(self):
         self.log.write(self.dstaddr + " close")
+        self.state = "closed"
         self.recvbuf = ""
+        self.sendbuf = ""
         try:
-            self.sock.shutdown(socket.SHUT_RDWR)
+            self.shutdown(socket.SHUT_RDWR)
+            self.close()
         except:
             pass
+
+    def handle_read(self):
+        try:
+            t = self.recv(8192)
+        except:
+            self.handle_close()
+            return
+        if len(t) == 0:
+            self.handle_close()
+            return
+        self.recvbuf += t
+        self.got_data()
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return (len(self.sendbuf) > 0)
+
+    def handle_write(self):
+        try:
+            sent = self.send(self.sendbuf)
+        except:
+            self.handle_close()
+            return
+        self.sendbuf = self.sendbuf[sent:]
 
     def got_data(self):
         while True:
@@ -164,6 +181,10 @@ class NodeConn(Greenlet):
                 self.log.write("UNKNOWN COMMAND %s %s" % (command, repr(msg)))
 
     def send_message(self, command, message, pushbuf=False):
+        if self.state != "connected" and not pushbuf:
+            self.log.write("WARNING: sending without connection")
+            return
+
         if verbose_sendmsg(command):
             self.log.write("send %s %s" % (command, repr(message)))
 
@@ -177,8 +198,9 @@ class NodeConn(Greenlet):
         th = hashlib.sha256(data).digest()
         h = hashlib.sha256(th).digest()
         tmsg += h[:4]
+
         tmsg += data
-        self.sock.send(tmsg)
+        self.sendbuf += tmsg
         self.last_sent = time.time()
 
     def got_message(self, command, message):
@@ -226,30 +248,25 @@ class NodeConn(Greenlet):
 
             self.send_message("addr", msgout)
 
-class NodeServer(Greenlet):
+class NodeServer(asyncore.dispatcher):
     def __init__(self, host, port, log, peermgr):
-        Greenlet.__init__(self)
+        asyncore.dispatcher.__init__(self)
         self.log = log
-        self.peermgr = peermgr        
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((host, port))
-        self.sock.listen(25)
-
-    def _run(self):
-        while True:
-            self.handle_accept()
+        self.peermgr = peermgr
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        self.bind((host, port))
+        self.listen(25)
 
     def handle_accept(self):
-        pair = self.sock.accept()
+        pair = self.accept()
         if pair is None:
             pass
         else:
             sock, addr = pair
             self.log.write('Incoming connection from %s' % repr(addr))
             handler = NodeConn(self.log, self.peermgr, sock=sock,
-                               dstaddr=addr[0], dstport=addr[1])
-            handler.start()
+                       dstaddr=addr[0], dstport=addr[1])
 
 class PeerManager(object):
     def __init__(self, log):
@@ -264,7 +281,6 @@ class PeerManager(object):
         self.tried[host] = True
         c = NodeConn(self.log, self, dstaddr=host, dstport=port)
         self.peers.append(c)
-        return c
 
     def new_addrs(self, addrs):
         for addr in addrs:
@@ -349,14 +365,6 @@ if __name__ == '__main__':
 
     peermgr = PeerManager(log)
 
-    threads = []
-
-    # connect to specified remote node
-    if addnode:
-        c = peermgr.add(settings['host'], settings['port'])
-        c.start()
-        threads.append(c)
-
     # start HTTP server for JSON-RPC
     #s = httpsrv.Server('', settings['rpcport'], rpc.RPCRequestHandler,
     #          (log, peermgr,
@@ -364,14 +372,13 @@ if __name__ == '__main__':
 
     if settings['listen']:
         p2pserver = NodeServer(settings['listen_host'],
-                               settings['listen_port'],
-                               log, peermgr)
+                       settings['listen_port'],
+                       log, peermgr)
 
-        # program main loop
-        p2pserver.start()
-        threads.append(p2pserver)
+    # connect to specified remote node
+    if addnode:
+        peermgr.add(settings['host'], settings['port'])
 
-    def shutdown():
-        for t in threads: t.kill()
-    gevent.signal(signal.SIGINT, shutdown)
-    gevent.joinall(threads)
+    # program main loop
+    asyncore.loop()
+
